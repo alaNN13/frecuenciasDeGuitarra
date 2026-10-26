@@ -231,7 +231,6 @@ class MusicNotesApp:
         columns = ("time", "note", "freq")
         self.table = ttk.Treeview(results_frame, columns=columns,
                                   show="headings", height=6)
-        self.table.heading("time", text="Tiempo (s)")
         self.table.heading("note", text="Nota")
         self.table.heading("freq", text="Frecuencia (Hz)")
         self.table.column("time", width=90, anchor="center")
@@ -472,7 +471,6 @@ class MusicNotesApp:
                     if freq:
                         note, midi = frequency_to_note(freq)
                         results.append({
-                            "time": start / self.sample_rate,
                             "note": note,
                             "freq": freq,
                             "midi": midi
@@ -494,7 +492,6 @@ class MusicNotesApp:
             self.table.delete(item)
         for item in results:
             self.table.insert("", "end", values=(
-                f"{item['time']:.2f}", item["note"], f"{item['freq']:.2f}"
             ))
         if results:
             first = results[0]
@@ -667,9 +664,7 @@ class MusicNotesApp:
                 Spacer(1, 14),
                 Paragraph("Notas detectadas", styles["Heading2"])
             ]
-            data = [["Tiempo (s)", "Nota estimada", "Frecuencia (Hz)"]]
             for item in self.results:
-                data.append([f"{item['time']:.2f}", item["note"], f"{item['freq']:.2f}"])
             if len(data) == 1:
                 data.append(["-", "No identificada", "-"])
             table = Table(data, repeatRows=1, colWidths=[110, 180, 150])
