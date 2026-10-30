@@ -20,7 +20,7 @@ import nucleo_backend as backend
 
 try:
     import sounddevice as sd
-except ImportError:
+except (ImportError, OSError):
     sd = None
 
 try:
@@ -38,6 +38,10 @@ GREEN = "#66BB6A"
 RED = "#E53935"
 MUTED = "#888888"
 
+# Tramo de la señal visible según la escala de tiempo (segundos). None = toda la señal.
+# s: señal completa (compacta) · ms: tramo medio · ns: tramo corto (señal "más larga", se desplaza).
+VENTANA_VISIBLE_S = {"s": None, "ms": 10.0, "ms_puntual": 10.0, "ns": 1.0}
+
 class MusicNotesAppUI:
     def __init__(self, root):
         self.root = root
@@ -51,15 +55,20 @@ class MusicNotesAppUI:
         self.audio_data = None
         self.sample_rate = None
         self.dsp_results = None
-        self.predictions = []
+        self.predictions = []        # lo que se muestra actualmente en la tabla / pentagrama
+        self.raw_predictions = []    # análisis crudo (autocorrelación) por fotograma, tiempo en ns -> escalas s y ns
+        self.yin_predictions = []    # detecciones YIN por fotograma, tiempo en ns -> escalas ms y ms puntual
+        self.note_segments = []      # notas realmente tocadas (modo "ms puntual")
         self.dsp_done = False
         self.predictions_done = False
+        self.is_latin = True
+        self.time_scale = "ms"       # "ms" | "ms_puntual" | "s" | "ns"
+        self.view_start = 0.0        # inicio (s) del tramo visible en onda y espectrograma
+        self._amp = None             # amplitud máxima de la señal (eje Y fijo al desplazar)
 
         self._configure_styles()
         self._build_ui()
         self.log("Sistema iniciado. Interfaz modular cargada correctamente.")
-        
-        self.is_latin = True
 
     def _configure_styles(self):
         style = ttk.Style()
@@ -109,13 +118,19 @@ class MusicNotesAppUI:
         self.ax_spec = self.figure.add_subplot(312)
         self.ax_staff = self.figure.add_subplot(313)
         
-        self._style_axes(self.ax_wave, "Forma de onda", "Tiempo (s)", "Amplitud")
-        self._style_axes(self.ax_spec, "Espectrograma", "Tiempo (s)", "Frecuencia (Hz)")
+        self._style_axes(self.ax_wave, "Forma de onda", "Tiempo (ms)", "Amplitud")
+        self._style_axes(self.ax_spec, "Espectrograma", "Tiempo (ms)", "Frecuencia (Hz)")
         self._style_staff_axes(self.ax_staff, "Pentagrama (Notación Formal)")
         
         self.figure.tight_layout(pad=2.0)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_panel)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(8, 0))
+        self.view_scroll = ttk.Scrollbar(self.plot_panel, orient="horizontal", command=self._on_view_scroll)
+        self.view_scroll.pack(fill="x", pady=(4, 0))
+        widget = self.canvas.get_tk_widget()
+        widget.bind("<MouseWheel>", self._on_mousewheel)                 # Windows / macOS
+        widget.bind("<Button-4>", self._on_mousewheel)                   # Linux
+        widget.bind("<Button-5>", self._on_mousewheel)
 
         # 3b. Panel de Controles
         controls = tk.Frame(body, bg=PANEL, padx=14, pady=12)
@@ -143,7 +158,7 @@ class MusicNotesAppUI:
         tk.Label(results_frame, text="NOTAS DETECTADAS", bg=PANEL, fg=ORANGE, font=("Segoe UI", 11, "bold")).pack(anchor="w")
         
         self.table = ttk.Treeview(results_frame, columns=("time", "note", "freq"), show="headings", height=6)
-        self.table.heading("time", text="Tiempo (ns)")
+        self.table.heading("time", text="Tiempo (ms)") #por defecto inicia en milisegundos
         self.table.heading("note", text="Nota")
         self.table.heading("freq", text="Frecuencia (Hz)")
         self.table.column("time", width=90, anchor="center")
@@ -190,14 +205,144 @@ class MusicNotesAppUI:
         self.dsp_done = False
         self.predictions_done = False
         self.predictions = []
+        self.raw_predictions = []
+        self.yin_predictions = []
+        self.note_segments = []
+        self.dsp_results = None
+        self.view_start = 0.0
+        self._amp = None
         for item in self.table.get_children():
             self.table.delete(item)
         self.dsp_button.configure(state="normal" if self.audio_data is not None else "disabled")
         self.predict_button.configure(state="disabled")
         self.report_button.configure(state="disabled")
         self.metrics_label.configure(text="Frecuencia: -- Hz\nNota: --")
+        self.ax_spec.clear()
+        self._style_axes(self.ax_spec, "Espectrograma", self._xlabel(), "Frecuencia (Hz)")
         self.ax_staff.clear()
         self._style_staff_axes(self.ax_staff, "Pentagrama (Notación Formal)")
+        self.canvas.draw_idle()
+
+    # ==========================================
+    # ESCALA DE TIEMPO COMPARTIDA (tabla / onda / espectrograma)
+    # ==========================================
+    def _time_factor(self):
+        """Unidades de la escala actual por segundo (ms y ms puntual -> 1000)."""
+        return {"ms": 1e3, "ms_puntual": 1e3, "s": 1.0, "ns": 1e9}[self.time_scale]
+
+    def _xlabel(self):
+        unit = "ms" if self.time_scale == "ms_puntual" else self.time_scale
+        return f"Tiempo ({unit})"
+
+    def _draw_played_overlay(self, ax):
+        """
+        En modo 'ms puntual' atenúa los tramos donde NO hay nota tocada (silencios / ruido),
+        sin líneas ni etiquetas. En cualquier otro modo no dibuja nada.
+        """
+        if self.time_scale != "ms_puntual" or not self.note_segments or self.audio_data is None:
+            return
+        f = self._time_factor()
+        total = self._duration() * f
+        cursor = 0.0
+        for seg in self.note_segments:
+            start = seg["start_ns"] / 1e9 * f
+            end = min(seg["end_ns"] / 1e9 * f, total)
+            if start > cursor:
+                ax.axvspan(cursor, start, facecolor="#000000", alpha=0.65, lw=0, zorder=5)
+            cursor = max(cursor, end)
+        if cursor < total:
+            ax.axvspan(cursor, total, facecolor="#000000", alpha=0.65, lw=0, zorder=5)
+
+    # ---------- tramo visible (la escala de tiempo cambia cuánto se ve de la señal) ----------
+    def _duration(self):
+        return len(self.audio_data) / self.sample_rate if self.audio_data is not None else 0.0
+
+    def _visible_window(self):
+        """(inicio, fin) en segundos del tramo visible según la escala actual."""
+        dur = self._duration()
+        win = VENTANA_VISIBLE_S[self.time_scale]
+        if win is None or win >= dur:
+            return 0.0, max(dur, 0.01)
+        self.view_start = min(max(self.view_start, 0.0), dur - win)
+        return self.view_start, self.view_start + win
+
+    def _update_scrollbar(self):
+        dur = self._duration()
+        if dur <= 0:
+            self.view_scroll.set(0, 1)
+            return
+        t0, t1 = self._visible_window()
+        self.view_scroll.set(t0 / dur, t1 / dur)
+
+    def _on_view_scroll(self, *args):
+        dur = self._duration()
+        win = VENTANA_VISIBLE_S[self.time_scale]
+        if self.audio_data is None or win is None or win >= dur:
+            return
+        if args[0] == "moveto":
+            self.view_start = float(args[1]) * dur
+        elif args[0] == "scroll":
+            step = win * (0.9 if args[2] == "pages" else 0.1)
+            self.view_start += int(args[1]) * step
+        self._apply_view_window()
+
+    def _on_mousewheel(self, event):
+        up = getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4
+        self._on_view_scroll("scroll", -1 if up else 1, "units")
+
+    def _apply_view_window(self):
+        """Mueve el tramo visible: reajusta la onda y solo el rango X del espectrograma."""
+        t0, t1 = self._visible_window()
+        f = self._time_factor()
+        self._plot_waveform(relayout=False)
+        if self.dsp_results is not None:
+            self.ax_spec.set_xlim(t0 * f, t1 * f)
+        self._update_scrollbar()
+        self.canvas.draw_idle()
+
+    def _plot_waveform(self, relayout=True):
+        if self.audio_data is None:
+            return
+        f = self._time_factor()
+        t0, t1 = self._visible_window()
+        i0 = max(0, int(t0 * self.sample_rate))
+        i1 = min(len(self.audio_data), int(np.ceil(t1 * self.sample_rate)) + 1)
+        seg = self.audio_data[i0:i1]
+        step = max(1, len(seg) // 12000)
+        times = (np.arange(0, len(seg), step) + i0) / self.sample_rate * f
+        if self._amp is None:
+            self._amp = max(float(np.max(np.abs(self.audio_data))), 0.01)
+
+        self.ax_wave.clear()
+        self._style_axes(self.ax_wave, "Forma de onda", self._xlabel(), "Amplitud")
+        self.ax_wave.plot(times, seg[::step], color=ORANGE, linewidth=0.8)
+        self.ax_wave.set_xlim(t0 * f, t1 * f)
+        self.ax_wave.set_ylim(-self._amp * 1.05, self._amp * 1.05)
+        self.ax_wave.ticklabel_format(axis="x", style="plain", useOffset=False)
+        self._draw_played_overlay(self.ax_wave)
+        if relayout:
+            self.figure.tight_layout(pad=2.0)
+        self._update_scrollbar()
+        self.canvas.draw_idle()
+
+    def _plot_spectrogram(self):
+        if self.dsp_results is None:
+            return
+        f = self._time_factor()
+        t0, t1 = self._visible_window()
+        freqs, times, magnitude = self.dsp_results
+        self.ax_spec.clear()
+        self._style_axes(self.ax_spec, "Espectrograma", self._xlabel(), "Frecuencia (Hz)")
+        fmax = min(5000, self.sample_rate / 2)
+        mask = freqs <= fmax
+        db = 20 * np.log10(np.maximum(magnitude[mask], 1e-7))
+        self.ax_spec.pcolormesh(times * f, freqs[mask], db, shading="auto",
+                                cmap="inferno", vmin=-80, vmax=-10)
+        self.ax_spec.set_ylim(0, fmax)
+        self.ax_spec.set_xlim(t0 * f, t1 * f)
+        self.ax_spec.ticklabel_format(axis="x", style="plain", useOffset=False)
+        self._draw_played_overlay(self.ax_spec)
+        self.figure.tight_layout(pad=2.0)
         self.canvas.draw_idle()
 
     # ==========================================
@@ -229,18 +374,6 @@ class MusicNotesAppUI:
             self._plot_waveform()
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
-
-    def _plot_waveform(self):
-        if self.audio_data is None: return
-        self.ax_wave.clear()
-        self._style_axes(self.ax_wave, "Forma de onda", "Tiempo (s)", "Amplitud")
-        duration = len(self.audio_data) / self.sample_rate
-        step = max(1, len(self.audio_data) // 12000)
-        times = np.arange(0, len(self.audio_data), step) / self.sample_rate
-        self.ax_wave.plot(times, self.audio_data[::step], color=ORANGE, linewidth=0.8)
-        self.ax_wave.set_xlim(0, max(duration, 0.01))
-        self.figure.tight_layout(pad=2.0)
-        self.canvas.draw_idle()
 
     def handler_play(self):
         if self.audio_data is None:
@@ -277,19 +410,9 @@ class MusicNotesAppUI:
         self.dsp_done = True
         self.predict_button.configure(state="normal")
         self._set_status("DSP completado", GREEN)
-        
+
         if self.dsp_results:
-            freqs, times, magnitude = self.dsp_results
-            self.ax_spec.clear()
-            self._style_axes(self.ax_spec, "Espectrograma", "Tiempo (s)", "Frecuencia (Hz)")
-            
-            mask = freqs <= min(5000, self.sample_rate / 2)
-            db = 20 * np.log10(np.maximum(magnitude[mask], 1e-7))
-            self.ax_spec.pcolormesh(times, freqs[mask], db, shading="auto", cmap="inferno", vmin=-80, vmax=-10)
-            self.ax_spec.set_ylim(0, min(5000, self.sample_rate / 2))
-            self.figure.tight_layout(pad=2.0)
-            self.canvas.draw_idle()
-            
+            self._plot_spectrogram()
             self.log("Análisis DSP completado y espectrograma renderizado con éxito.")
 
     def handler_run_prediction(self):
@@ -300,7 +423,9 @@ class MusicNotesAppUI:
         
         def work():
             try:
-                self.predictions = backend.run_ml_prediction(self.audio_data, self.sample_rate)
+                # Crudo (escalas s / ns) y YIN (escalas ms / ms puntual)
+                self.raw_predictions = backend.run_ml_prediction(self.audio_data, self.sample_rate, method="autocorr")
+                self.yin_predictions = backend.run_ml_prediction(self.audio_data, self.sample_rate, method="yin")
                 self.root.after(0, self._finish_prediction_ui)
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", f"Fallo de predicción: {str(e)}"))
@@ -309,30 +434,22 @@ class MusicNotesAppUI:
         threading.Thread(target=work, daemon=True).start()
 
     def _finish_prediction_ui(self):
+        # 1. Detener indicadores de carga y habilitar controles (RF06)
         self.progress.stop()
         self.predictions_done = True
         self.predict_button.configure(state="normal")
         self.report_button.configure(state="normal")
-        self._set_status(f"Detección completada ({len(self.predictions)} notas)", GREEN)
-        self.log(f"Se detectaron {len(self.predictions)} cambios de nota.")
-        
-        for item in self.table.get_children():
-            self.table.delete(item)
-            
-        for item in self.predictions:
-            self.table.insert("", "end", values=(
-                str(item["time"]), item["note"], f"{item['freq']:.2f}"
-            ))
-            
-        if self.predictions:
-            first = self.predictions[0]
-            self.metrics_label.configure(text=f"Primera nota: {first['note']}\nFrecuencia: {first['freq']:.2f} Hz")
-            self._draw_matplotlib_staff(self.predictions)
-        else:
-            self.metrics_label.configure(text="Frecuencia: -- Hz\nNota: --")
-            self.ax_staff.clear()
-            self._style_staff_axes(self.ax_staff, "Pentagrama (Notación Formal)")
-            self.canvas.draw_idle()
+
+        # 2. Notas realmente tocadas (solo a partir de YIN)
+        self.note_segments = backend.group_played_notes(self.yin_predictions, self.sample_rate)
+
+        # 3. Aplicar la escala actual: refresca tabla, pentagrama, onda y espectrograma
+        self._apply_time_scale()
+
+        # 4. Estado y log
+        self._set_status(f"Detección completada ({len(self.predictions)} notas en {self._xlabel()})", GREEN)
+        self.log(f"Análisis crudo: {len(self.raw_predictions)} fotogramas con nota. "
+                 f"YIN: {len(self.yin_predictions)} fotogramas, {len(self.note_segments)} notas realmente tocadas.")
 
     def _draw_matplotlib_staff(self, results):
         ax = self.ax_staff
@@ -349,7 +466,9 @@ class MusicNotesAppUI:
         ax.plot([9.5, 9.5], [2, 6], color=WHITE, lw=2, zorder=1)
         ax.text(0.7, 3.2, "𝄞", color=ORANGE, fontsize=36, va="center", ha="center", zorder=2)
 
-        if not results: return
+        if not results:
+            self.canvas.draw_idle()
+            return
 
         max_notes = min(len(results), 12)
         x_positions = np.linspace(2.0, 9.0, max_notes)
@@ -395,6 +514,81 @@ class MusicNotesAppUI:
             col = self.table.identify_column(event.x)  # #2 corresponde a la columna "note"
             if col == "#2":
                 self.toggle_notation()
+            
+            elif col == "#1":
+                 self.toggle_time_scale()
+                 
+    def toggle_time_scale(self):
+        """Alterna cíclicamente: ms (desglose) -> ms (notas puntuales) -> s -> ns."""
+        cycle = ["ms", "ms_puntual", "s", "ns"]
+        self.time_scale = cycle[(cycle.index(self.time_scale) + 1) % len(cycle)]
+
+        header_text = ("Tiempo (ms - Notas puntuales)" if self.time_scale == "ms_puntual"
+                       else f"Tiempo ({self.time_scale})")
+        self.table.heading("time", text=header_text)
+        origen = "YIN" if self.time_scale in ("ms", "ms_puntual") else "análisis crudo"
+        self.log(f"Escala temporal cambiada a: {self.time_scale} ({origen})")
+
+        if self.predictions_done:
+            self._apply_time_scale()      # tabla + pentagrama + onda + espectrograma
+        else:
+            self._plot_waveform()         # sin detección aún: solo ajusta los ejes
+            self._plot_spectrogram()
+
+    def _apply_time_scale(self):
+        """Reconstruye tabla, pentagrama, forma de onda y espectrograma según la escala."""
+        if not self.predictions_done:
+            return
+
+        # ---- 1. Construir la lista a mostrar --------------------------------
+        shown = []
+        if self.time_scale == "ms_puntual":
+            # YIN: solo notas realmente tocadas, un renglón por nota (instante de ataque)
+            for seg in self.note_segments:
+                shown.append({
+                    "time": seg["start_ns"], "midi": seg["midi"], "note": seg["note"],
+                    "freq": seg["freq"],
+                    "time_display": f"{seg['start_ns'] / 1e6:.1f}",
+                })
+        elif self.time_scale == "ms":
+            # YIN: desglose completo, cada fotograma analizado
+            for item in self.yin_predictions:
+                row = item.copy()
+                row["time_display"] = f"{item['time'] / 1e6:.1f}"
+                shown.append(row)
+        else:
+            # s / ns: análisis crudo (autocorrelación original) tal cual, sin filtrar ni agrupar;
+            # solo se convierte la unidad de tiempo.
+            for item in self.raw_predictions:
+                row = item.copy()
+                if self.time_scale == "s":
+                    row["time_display"] = f"{item['time'] / 1e9:.3f}"
+                else:
+                    row["time_display"] = str(int(item["time"]))
+                shown.append(row)
+
+        # Nombre según la nomenclatura activa (Do/Re/Mi o C/D/E)
+        for row in shown:
+            row["note"] = self._get_note_name(row["midi"])
+        self.predictions = shown
+
+        # ---- 2. Tabla ---------------------------------------------------------
+        for child in self.table.get_children():
+            self.table.delete(child)
+        for item in self.predictions:
+            self.table.insert("", "end", values=(item["time_display"], item["note"], f"{item['freq']:.2f}"))
+
+        # ---- 3. Métrica principal y pentagrama -------------------------------
+        if self.predictions:
+            first = self.predictions[0]
+            self.metrics_label.configure(text=f"Primera nota: {first['note']}\nFrecuencia: {first['freq']:.2f} Hz")
+        else:
+            self.metrics_label.configure(text="Frecuencia: -- Hz\nNota: --")
+        self._draw_matplotlib_staff(self.predictions)
+
+        # ---- 4. Forma de onda y espectrograma en la misma escala -------------
+        self._plot_waveform()
+        self._plot_spectrogram()
 
     def _get_note_name(self, midi):
         """Convierte un valor MIDI a texto según la nomenclatura activa de forma general."""
@@ -412,38 +606,15 @@ class MusicNotesAppUI:
         return f"{notes[note_idx]}{octave}"
 
     def toggle_notation(self):
-        """Alterna el estado de la nomenclatura e instantáneamente actualiza toda la interfaz."""
-        # Conmutar estado
+        """Alterna Do/Re/Mi <-> C/D/E y refresca toda la interfaz con la escala actual."""
         self.is_latin = not self.is_latin
-        
-        if not self.predictions:
+        if not self.predictions_done:
             self.log("Nomenclatura alternada. (Sin notas detectadas actualmente)")
             return
-
-        # Actualizar las notas guardadas en el modelo con base en su identificador universal MIDI
-        for item in self.predictions:
-            if "midi" in item and item["midi"] is not None:
-                item["note"] = self._get_note_name(item["midi"])
-
-        # Refrescar los elementos visuales de la tabla
-        for child in self.table.get_children():
-            self.table.delete(child)
-            
-        for item in self.predictions:
-            self.table.insert("", "end", values=(
-                str(item["time"]), item["note"], f"{item['freq']:.2f}"
-            ))
-
-        # Actualizar la métrica principal lateral
-        if self.predictions:
-            first = self.predictions[0]
-            self.metrics_label.configure(
-                text=f"Primera nota: {first['note']}\nFrecuencia: {first['freq']:.2f} Hz"
-            )
-            # Redibujar el pentagrama vectorial en Matplotlib para reflejar el cambio en las notas
-            self._draw_matplotlib_staff(self.predictions)
-
+        self._apply_time_scale()
         self.log("Nomenclatura de notas visualizada en el esquema alternativo.")
+
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = MusicNotesAppUI(root)
