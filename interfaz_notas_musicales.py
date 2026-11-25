@@ -114,6 +114,31 @@ def estimate_f0_autocorrelation(frame, sample_rate):
     return None
 
 
+def compute_chromagram(freqs, magnitude, fmin=55.0, fmax=5000.0):
+    """
+    Cromagrama a partir de la magnitud de la STFT.
+    Agrupa la energía de cada bin de frecuencia en una de las 12 clases
+    de nota (Do..Si), sin importar la octava. Se normaliza por trama
+    para que el valor máximo de cada instante sea 1.
+    Devuelve una matriz de forma (12, n_tramas).
+    """
+    freqs = np.asarray(freqs, dtype=np.float64)
+    magnitude = np.asarray(magnitude, dtype=np.float64)
+    chroma = np.zeros((12, magnitude.shape[1]))
+    valid = (freqs >= fmin) & (freqs <= fmax) & (freqs > 0)
+    if not np.any(valid):
+        return chroma
+    midi = np.round(69 + 12 * np.log2(freqs[valid] / 440.0)).astype(int)
+    pitch_class = midi % 12
+    power = magnitude[valid] ** 2
+    for pc in range(12):
+        rows = pitch_class == pc
+        if np.any(rows):
+            chroma[pc] = power[rows].sum(axis=0)
+    max_per_frame = chroma.max(axis=0, keepdims=True)
+    return chroma / np.maximum(max_per_frame, 1e-12)
+
+
 class MusicNotesApp:
     def __init__(self, root):
         self.root = root
@@ -185,17 +210,21 @@ class MusicNotesApp:
         tk.Label(self.plot_panel, text="VISUALIZACIÓN DE LA SEÑAL Y PARTITURA",
                  bg=PANEL, fg=ORANGE, font=("Segoe UI", 11, "bold")).pack(anchor="w")
 
-        # Se configura Figure con 3 subplots: Forma de Onda, Espectrograma y Pentagrama
-        self.figure = Figure(figsize=(7.2, 7.0), dpi=100, facecolor=PANEL)
-        self.ax_wave = self.figure.add_subplot(311)
-        self.ax_spec = self.figure.add_subplot(312)
-        self.ax_staff = self.figure.add_subplot(313)
-        
+        # Se configura Figure con 4 subplots: Forma de Onda, Espectrograma, Cromagrama y Pentagrama
+        # El cromagrama recibe más altura (3.2) para que sus 12 filas de nota se distingan.
+        self.figure = Figure(figsize=(7.2, 8.6), dpi=100, facecolor=PANEL)
+        grid = self.figure.add_gridspec(4, 1, height_ratios=[0.8, 0.8, 3.2, 1.1])
+        self.ax_wave = self.figure.add_subplot(grid[0])
+        self.ax_spec = self.figure.add_subplot(grid[1])
+        self.ax_chroma = self.figure.add_subplot(grid[2])
+        self.ax_staff = self.figure.add_subplot(grid[3])
+
         self._style_axes(self.ax_wave, "Forma de onda", "Tiempo (s)", "Amplitud")
         self._style_axes(self.ax_spec, "Espectrograma", "Tiempo (s)", "Frecuencia (Hz)")
+        self._style_axes(self.ax_chroma, "Cromagrama", "Tiempo (s)", "Nota")
         self._style_staff_axes(self.ax_staff, "Pentagrama (Notación Formal)")
         
-        self.figure.tight_layout(pad=2.0)
+        self.figure.tight_layout(pad=1.2, h_pad=0.6)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_panel)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(8, 0))
 
@@ -377,7 +406,7 @@ class MusicNotesApp:
         times = np.arange(0, len(self.audio), step) / self.sample_rate
         self.ax_wave.plot(times, self.audio[::step], color=ORANGE, linewidth=0.8)
         self.ax_wave.set_xlim(0, max(duration, 0.01))
-        self.figure.tight_layout(pad=2.0)
+        self.figure.tight_layout(pad=1.2, h_pad=0.6)
         self.canvas.draw_idle()
 
     def play_audio(self):
@@ -417,13 +446,14 @@ class MusicNotesApp:
                     nperseg=nperseg, noverlap=noverlap
                 )
                 magnitude = np.abs(zxx)
-                self.root.after(0, lambda: self._finish_dsp(freqs, times, magnitude))
+                chroma = compute_chromagram(freqs, magnitude)
+                self.root.after(0, lambda: self._finish_dsp(freqs, times, magnitude, chroma))
             except Exception as exc:
                 self.root.after(0, lambda e=str(exc): self._dsp_error(e))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _finish_dsp(self, freqs, times, magnitude):
+    def _finish_dsp(self, freqs, times, magnitude, chroma=None):
         self.progress.stop()
         self.ax_spec.clear()
         self._style_axes(self.ax_spec, "Espectrograma (STFT)", "Tiempo (s)", "Frecuencia (Hz)")
@@ -433,13 +463,40 @@ class MusicNotesApp:
             self.ax_spec.pcolormesh(times, freqs[mask], db, shading="auto",
                                     cmap="inferno", vmin=-80, vmax=-10)
             self.ax_spec.set_ylim(0, min(5000, self.sample_rate / 2))
-        self.figure.tight_layout(pad=2.0)
+        self._plot_chromagram(times, chroma)
+        self.figure.tight_layout(pad=1.2, h_pad=0.6)
         self.canvas.draw_idle()
         self.dsp_done = True
         self.predict_button.configure(state="normal")
         self._set_status("DSP completado", GREEN)
         self.log("DSP terminado correctamente. Espectrograma actualizado.")
+        if chroma is not None and chroma.size:
+            dominant = NOTE_NAMES[int(np.argmax(chroma.sum(axis=1)))]
+            self.log(f"Cromagrama calculado. Clase de nota dominante: {dominant}.")
         self.log("Puedes ejecutar la detección preliminar de notas.")
+
+    def _plot_chromagram(self, times, chroma):
+        """Dibuja el cromagrama (12 clases de nota vs. tiempo)."""
+        self.ax_chroma.clear()
+        self._style_axes(self.ax_chroma, "Cromagrama", "Tiempo (s)", "Nota")
+        if chroma is None or not chroma.size or len(times) == 0:
+            return
+        t0 = float(times[0])
+        t1 = float(times[-1]) if len(times) > 1 else t0 + 0.01
+        self.ax_chroma.imshow(chroma, aspect="auto", origin="lower",
+                              cmap="inferno", vmin=0, vmax=1,
+                              extent=[t0, t1, -0.5, 11.5],
+                              interpolation="nearest")
+        self.ax_chroma.set_ylim(-0.5, 11.5)
+        self.ax_chroma.set_yticks(range(12))
+        self.ax_chroma.set_yticklabels(NOTE_NAMES, fontsize=7)
+        # Notas naturales en blanco y sostenidos en gris, para ubicarse rápido
+        for label, name in zip(self.ax_chroma.get_yticklabels(), NOTE_NAMES):
+            label.set_color(MUTED if "♯" in name else WHITE)
+        self.ax_chroma.grid(False)
+        # Líneas finas entre filas para separar cada nota
+        for y in np.arange(0.5, 11.5, 1.0):
+            self.ax_chroma.axhline(y, color="#2A2A2A", linewidth=0.8)
 
     def _dsp_error(self, error):
         self.progress.stop()
@@ -558,7 +615,7 @@ class MusicNotesApp:
         if not rendered_music21:
             self._draw_matplotlib_staff(results)
 
-        self.figure.tight_layout(pad=2.0)
+        self.figure.tight_layout(pad=1.2, h_pad=0.6)
         self.canvas.draw_idle()
 
     def _draw_matplotlib_staff(self, results):
